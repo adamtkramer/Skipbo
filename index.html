@@ -1,0 +1,1430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+<meta name="theme-color" content="#16303A" />
+<title>Spite &amp; Malice — play live</title>
+<meta name="description" content="Two-player Spite & Malice, live over the web. Create a room, share the code, play on separate phones." />
+<meta property="og:title" content="Spite & Malice — play live" />
+<meta property="og:description" content="Create a room, share the code, play Spite & Malice live with someone on their own phone." />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='16' fill='%2316303A'/%3E%3Ctext x='50' y='68' font-size='58' text-anchor='middle' fill='%23C9A227'%3E%E2%99%A0%3C/text%3E%3C/svg%3E" />
+<script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; background: #101620; }
+  body { -webkit-tap-highlight-color: transparent; overscroll-behavior-y: contain; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react" data-type="module">
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+/* ============================================================
+   SPITE & MALICE — house rules (engine unchanged from the
+   original single-player build)
+   2 standard decks + 4 jokers (108 cards, every card tracked)
+   15-card stock · A through K center piles · jokers wild
+   4 discard piles each · 5-card hand · draw at start of turn
+   ============================================================ */
+
+const SUITS = [
+  { k: "S", g: "♠", red: false },
+  { k: "H", g: "♥", red: true },
+  { k: "D", g: "♦", red: true },
+  { k: "C", g: "♣", red: false },
+];
+const RANK_LABEL = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"];
+const STOCK_SIZE = 15;
+const HAND_SIZE = 5;
+const PILE_TOP = 13;
+const MAX_PILES = 12; // 8 aces + 4 wilds could all be opened at once
+
+/* ---------- true randomness ---------- */
+function randInt(n) {
+  if (typeof crypto !== "undefined" && crypto.getRandomValues) {
+    const limit = Math.floor(0xffffffff / n) * n;
+    const a = new Uint32Array(1);
+    let v;
+    do {
+      crypto.getRandomValues(a);
+      v = a[0];
+    } while (v >= limit);
+    return v % n;
+  }
+  return Math.floor(Math.random() * n);
+}
+function shuffle(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = randInt(i + 1);
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+/* ---------- deck ---------- */
+function buildDeck() {
+  const cards = [];
+  for (const copy of [1, 2]) {
+    for (const s of SUITS) {
+      for (let r = 1; r <= 13; r++) {
+        cards.push({ id: `${copy}${s.k}${r}`, rank: r, suit: s.k, copy });
+      }
+    }
+    cards.push({ id: `${copy}JKa`, rank: 0, suit: null, copy });
+    cards.push({ id: `${copy}JKb`, rank: 0, suit: null, copy });
+  }
+  return cards;
+}
+const FULL_DECK_SIZE = 108;
+
+// Wilds 20, face cards 10, aces 1, everything else at face value.
+const cardValue = (c) => (c.rank === 0 ? 20 : c.rank >= 11 ? 10 : c.rank);
+const label = (c) => (c.rank === 0 ? "★" : RANK_LABEL[c.rank - 1]);
+const isRed = (c) => (c.suit ? SUITS.find((s) => s.k === c.suit).red : false);
+const top = (p) => (p && p.length ? p[p.length - 1] : null);
+// A pile is { id, base, cards }. base counts cards taken from underneath in a
+// last-resort reshuffle, so the pile keeps its rank even when it gets thinner.
+const pileRank = (pile) => pile.base + pile.cards.length;
+const canPlace = (card, pile) =>
+  !!card && pileRank(pile) < PILE_TOP && (card.rank === 0 || card.rank === pileRank(pile) + 1);
+// index -1 means "open a new pile"
+const canStart = (G, card) => !!card && G.build.length < MAX_PILES && (card.rank === 0 || card.rank === 1);
+const canPlayTo = (G, card, idx) => (idx === -1 ? canStart(G, card) : canPlace(card, G.build[idx]));
+
+/* ---------- names on the log line ---------- */
+function nm(G, who) {
+  if (G.names && G.names[who]) return G.names[who];
+  return who === "p1" ? "Player 1" : "Player 2";
+}
+function otherOf(who) {
+  return who === "p1" ? "p2" : "p1";
+}
+
+/* ---------- game setup ---------- */
+function newGame(dealerIsP1) {
+  const deck = shuffle(buildDeck());
+  const p1 = { stock: [], hand: [], discards: [[], [], [], []] };
+  const p2 = { stock: [], hand: [], discards: [[], [], [], []] };
+  for (let i = 0; i < STOCK_SIZE; i++) {
+    p1.stock.push(deck.pop());
+    p2.stock.push(deck.pop());
+  }
+  for (let i = 0; i < HAND_SIZE; i++) {
+    p1.hand.push(deck.pop());
+    p2.hand.push(deck.pop());
+  }
+  return {
+    draw: deck,
+    completed: [],
+    build: [],
+    players: { p1, p2 },
+    turn: dealerIsP1 ? "p2" : "p1",
+    winner: null,
+    passes: 0,
+    log: [{ kind: "dealt" }],
+    names: null,
+    pileSeq: 0,
+    scored: false,
+  };
+}
+
+/* ---------- mechanics (unchanged rules) ---------- */
+function stripPiles(G) {
+  // Absolute last resort: leave the top card of each centre pile where it is and
+  // shuffle everything underneath into a new draw pile. Discard piles are never touched.
+  const pool = [];
+  for (const pile of G.build) {
+    if (pile.cards.length > 1) {
+      const under = pile.cards.splice(0, pile.cards.length - 1);
+      pile.base += under.length;
+      pool.push(...under);
+    }
+  }
+  if (!pool.length) return false;
+  G.draw = shuffle(pool);
+  G.log.push({ kind: "strip", n: pool.length });
+  return true;
+}
+function drawOne(G) {
+  if (!G.draw.length) {
+    // Only finished King piles come back normally. Discard piles are never touched.
+    if (!G.completed.length) return stripPiles(G) ? G.draw.pop() : null;
+    G.draw = shuffle(G.completed);
+    G.completed = [];
+    G.log.push({ kind: "reshuffle", n: G.draw.length });
+  }
+  return G.draw.pop();
+}
+function doPass(G, who) {
+  G.passes = (G.passes || 0) + 1;
+  G.log.push({ kind: "pass", who, end: true });
+  G.turn = otherOf(who);
+  refill(G, G.turn);
+  if (G.passes >= 2 && !G.players[G.turn].hand.length) {
+    G.winner = "draw";
+    G.log.push({ kind: "stalemate" });
+  }
+}
+function refill(G, who) {
+  const p = G.players[who];
+  while (p.hand.length < HAND_SIZE) {
+    const c = drawOne(G);
+    if (!c) break;
+    p.hand.push(c);
+  }
+}
+function placeOnBuild(G, who, card, idx) {
+  if (idx === -1) {
+    G.build.push({ id: `p${(G.pileSeq = (G.pileSeq || 0) + 1)}`, base: 0, cards: [card] });
+    return;
+  }
+  G.build[idx].cards.push(card);
+  if (pileRank(G.build[idx]) === PILE_TOP) {
+    G.completed.push(...G.build[idx].cards);
+    G.build.splice(idx, 1);
+    G.log.push({ kind: "pile-complete", who });
+  }
+}
+function takeFrom(G, who, src) {
+  const p = G.players[who];
+  if (src.type === "hand") return p.hand.splice(src.index, 1)[0];
+  if (src.type === "stock") return p.stock.pop();
+  if (src.type === "discard") return p.discards[src.index].pop();
+  return null;
+}
+function peekFrom(G, who, src) {
+  const p = G.players[who];
+  if (src.type === "hand") return p.hand[src.index];
+  if (src.type === "stock") return top(p.stock);
+  if (src.type === "discard") return top(p.discards[src.index]);
+  return null;
+}
+function cardLabelText(card, standsFor) {
+  if (card.rank === 0) return `a joker as ${RANK_LABEL[standsFor - 1]}`;
+  return label(card) + (card.suit ? SUITS.find((s) => s.k === card.suit).g : "");
+}
+function doPlay(G, who, src, pileIdx) {
+  const card = peekFrom(G, who, src);
+  if (!canPlayTo(G, card, pileIdx)) return false;
+  G.passes = 0;
+  const target = pileIdx === -1 ? 1 : pileRank(G.build[pileIdx]) + 1;
+  takeFrom(G, who, src);
+  const cardText = cardLabelText(card, target);
+  placeOnBuild(G, who, card, pileIdx);
+  G.log.push({
+    kind: "play",
+    who,
+    cardLabel: cardText,
+    from: src.type === "stock" ? "stock" : src.type === "discard" ? "discard" : null,
+    pileNew: pileIdx === -1,
+    stock: src.type === "stock",
+  });
+  if (src.type === "stock" && G.players[who].stock.length === 0) {
+    G.winner = who;
+  }
+  if (G.players[who].hand.length === 0 && !G.winner) {
+    refill(G, who);
+    G.log.push({ kind: "hand-empty", who });
+  }
+  return true;
+}
+function doDiscard(G, who, handIndex, pileIdx) {
+  G.passes = 0;
+  const p = G.players[who];
+  const card = p.hand.splice(handIndex, 1)[0];
+  p.discards[pileIdx].push(card);
+  G.log.push({
+    kind: "discard",
+    who,
+    cardLabel: label(card) + (card.suit ? SUITS.find((s) => s.k === card.suit).g : ""),
+    end: true,
+  });
+  G.turn = otherOf(who);
+  refill(G, G.turn);
+  return true;
+}
+
+/* log line renderer — same wording as the original, "You" resolved per viewer */
+function actorLabel(who, mySeat, G) {
+  if (who === mySeat) return "You";
+  return nm(G, who);
+}
+function renderLog(entry, mySeat, G) {
+  switch (entry.kind) {
+    case "dealt":
+      return "Cards dealt. 108 accounted for.";
+    case "play": {
+      const name = actorLabel(entry.who, mySeat, G);
+      const from = entry.from === "stock" ? " from the stock" : entry.from === "discard" ? " from a discard pile" : "";
+      const to = entry.pileNew ? ", opening a new pile" : "";
+      return `${name} played ${entry.cardLabel}${from}${to}.`;
+    }
+    case "pile-complete":
+      return `${actorLabel(entry.who, mySeat, G)} finished a pile with the King. It clears the table and joins the reshuffle stack.`;
+    case "hand-empty":
+      return `${actorLabel(entry.who, mySeat, G)} emptied their hand and drew five more.`;
+    case "discard":
+      return `${actorLabel(entry.who, mySeat, G)} discarded ${entry.cardLabel}. Turn over.`;
+    case "pass":
+      return `${actorLabel(entry.who, mySeat, G)} had nothing to play or discard and passed.`;
+    case "reshuffle":
+      return `Draw pile ran out — finished piles reshuffled underneath (${entry.n}).`;
+    case "strip":
+      return `Nothing left to draw and no finished piles — ${entry.n} cards taken from under the centre piles and shuffled. Every pile keeps its top card and its rank.`;
+    case "stalemate":
+      return "No cards left in play. The hand is a stalemate.";
+    case "system":
+      return entry.text;
+    default:
+      return "";
+  }
+}
+
+/* ---------- integrity census (unchanged) ---------- */
+function census(G) {
+  const counts = new Map();
+  let total = 0;
+  const add = (arr) => {
+    for (const c of arr) {
+      total++;
+      const key = c.rank === 0 ? "JOKER" : `${c.suit}${c.rank}`;
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+  };
+  add(G.draw);
+  add(G.completed);
+  G.build.forEach((pile) => add(pile.cards));
+  for (const k of ["p1", "p2"]) {
+    add(G.players[k].stock);
+    add(G.players[k].hand);
+    G.players[k].discards.forEach(add);
+  }
+  let ok = total === FULL_DECK_SIZE && (counts.get("JOKER") || 0) === 4;
+  const dupes = [];
+  for (const [k, v] of counts) {
+    if (k === "JOKER") continue;
+    if (v !== 2) {
+      ok = false;
+      dupes.push(`${k}×${v}`);
+    }
+  }
+  return { ok, total, dupes };
+}
+
+/* ---------- scoring: wilds 20, face cards 10, aces 1, else face value ---------- */
+function applyScoreIfWinner(room) {
+  const g = room.game;
+  if (!g || !g.winner || g.scored) return;
+  g.scored = true;
+  room.board.games += 1;
+  if (g.winner === "draw") return;
+  const loser = otherOf(g.winner);
+  const stock = g.players[loser].stock;
+  const pts = stock.reduce((s, c) => s + cardValue(c), 0);
+  room.board[`${g.winner}Wins`] += 1;
+  room.board[`${g.winner}Pts`] += pts;
+  room.board.history = [
+    { w: g.winner, pts, left: stock.length, at: Date.now() },
+    ...(room.board.history || []),
+  ].slice(0, 40);
+}
+
+/* ============================================================
+   SHARED-STATE BACKEND — a JSON blob per room (jsonblob.com),
+   polled every ~1.5s. One directory blob maps short room codes
+   to the per-room blob id.
+   ============================================================ */
+const JB = "https://jsonblob.com/api/jsonBlob";
+const DIRECTORY_ID = "019fe884-9a36-711f-90c6-1bbbf331f2a4";
+const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"; // no 0/O/1/I/L
+const SESSION_KEY = "spite-malice:session";
+
+async function blobGet(id) {
+  const r = await fetch(`${JB}/${id}`, { cache: "no-store" });
+  if (!r.ok) throw new Error("get-failed");
+  return r.json();
+}
+async function blobPut(id, obj) {
+  const r = await fetch(`${JB}/${id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(obj),
+  });
+  if (!r.ok) throw new Error("put-failed");
+}
+async function blobCreate(obj) {
+  const r = await fetch(JB, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(obj),
+  });
+  if (!r.ok) throw new Error("create-failed");
+  const loc = r.headers.get("Location") || "";
+  return loc.split("/").pop();
+}
+function genCode() {
+  let s = "";
+  for (let i = 0; i < 5; i++) s += CODE_ALPHABET[randInt(CODE_ALPHABET.length)];
+  return s;
+}
+function blankBoard() {
+  return { games: 0, p1Wins: 0, p2Wins: 0, p1Pts: 0, p2Pts: 0, history: [] };
+}
+async function createRoom(name) {
+  const roomObj = {
+    code: null,
+    rev: 1,
+    phase: "waiting",
+    seats: { p1: { name: name || "Player 1", present: true }, p2: { name: null, present: false } },
+    game: null,
+    board: blankBoard(),
+    createdAt: Date.now(),
+  };
+  const roomId = await blobCreate(roomObj);
+  let code = null;
+  for (let attempt = 0; attempt < 6 && !code; attempt++) {
+    const candidate = genCode();
+    let dir;
+    try {
+      dir = await blobGet(DIRECTORY_ID);
+    } catch (e) {
+      dir = { codes: {} };
+    }
+    if (dir.codes && dir.codes[candidate]) continue;
+    dir.codes = dir.codes || {};
+    dir.codes[candidate] = roomId;
+    await blobPut(DIRECTORY_ID, dir);
+    code = candidate;
+  }
+  if (!code) throw new Error("code-failed");
+  roomObj.code = code;
+  await blobPut(roomId, roomObj);
+  return { roomId, room: roomObj };
+}
+async function findRoomIdByCode(code) {
+  const dir = await blobGet(DIRECTORY_ID);
+  return (dir.codes && dir.codes[code]) || null;
+}
+async function joinRoomAndDeal(roomId, room, name) {
+  room.seats.p2 = { name: name || "Player 2", present: true };
+  room.phase = "playing";
+  const dealerIsP1 = room.board.games % 2 === 0;
+  const g = newGame(dealerIsP1);
+  g.names = { p1: room.seats.p1.name, p2: room.seats.p2.name };
+  room.game = g;
+  room.rev += 1;
+  await blobPut(roomId, room);
+  return room;
+}
+
+/* ============================================================
+   UI
+   ============================================================ */
+function App() {
+  const [screen, setScreen] = useState("loading"); // loading | home | join | room
+  const [roomId, setRoomId] = useState(null);
+  const [mySeat, setMySeat] = useState(null);
+  const [room, setRoom] = useState(null);
+  const [sel, setSel] = useState(null);
+  const [sending, setSending] = useState(false);
+  const [tab, setTab] = useState("log");
+  const [myName, setMyName] = useState("");
+  const [joinCode, setJoinCode] = useState("");
+  const [lobbyBusy, setLobbyBusy] = useState(false);
+  const [lobbyError, setLobbyError] = useState("");
+  const [netError, setNetError] = useState("");
+  const lastRevRef = useRef(0);
+  const logRef = useRef(null);
+
+  /* ---- boot: reconnect from localStorage, or read #room= from a shared link ---- */
+  useEffect(() => {
+    (async () => {
+      let saved = null;
+      try {
+        saved = JSON.parse(localStorage.getItem(SESSION_KEY) || "null");
+      } catch (e) {
+        saved = null;
+      }
+      if (saved && saved.roomId && saved.seat) {
+        try {
+          const data = await blobGet(saved.roomId);
+          if (data.seats[saved.seat] && data.seats[saved.seat].present) {
+            lastRevRef.current = data.rev;
+            setRoomId(saved.roomId);
+            setMySeat(saved.seat);
+            setRoom(data);
+            setScreen("room");
+            return;
+          }
+        } catch (e) {
+          /* room gone or unreachable — fall through to home */
+        }
+        localStorage.removeItem(SESSION_KEY);
+      }
+      const params = new URLSearchParams(location.hash.replace(/^#/, ""));
+      const linkCode = params.get("room");
+      if (linkCode) {
+        setJoinCode(linkCode.toUpperCase());
+        setScreen("join");
+        return;
+      }
+      setScreen("home");
+    })();
+  }, []);
+
+  /* ---- poll the room while one is open ---- */
+  useEffect(() => {
+    if (!roomId) return;
+    let stopped = false;
+    const tick = async () => {
+      try {
+        const data = await blobGet(roomId);
+        if (!stopped && data.rev > lastRevRef.current) {
+          lastRevRef.current = data.rev;
+          setRoom(data);
+        }
+        if (!stopped) setNetError("");
+      } catch (e) {
+        /* transient — retry on the next tick */
+      }
+    };
+    const id = setInterval(tick, 1500);
+    return () => {
+      stopped = true;
+      clearInterval(id);
+    };
+  }, [roomId]);
+
+  useEffect(() => {
+    if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  }, [room && room.game && room.game.log.length, tab]);
+
+  /* clear a stale selection when the turn changes under us */
+  useEffect(() => {
+    setSel(null);
+  }, [room && room.game && room.game.turn, room && room.game && room.game.winner]);
+
+  /* ---- lobby actions ---- */
+  const handleCreate = async () => {
+    setLobbyBusy(true);
+    setLobbyError("");
+    try {
+      const { roomId: id, room: r } = await createRoom(myName.trim());
+      localStorage.setItem(SESSION_KEY, JSON.stringify({ roomId: id, seat: "p1", code: r.code }));
+      lastRevRef.current = r.rev;
+      setRoomId(id);
+      setMySeat("p1");
+      setRoom(r);
+      setScreen("room");
+    } catch (e) {
+      setLobbyError("Could not create a game. Check your connection and try again.");
+    }
+    setLobbyBusy(false);
+  };
+  const handleJoin = async () => {
+    setLobbyBusy(true);
+    setLobbyError("");
+    try {
+      const code = joinCode.trim().toUpperCase();
+      if (!code) {
+        setLobbyError("Enter a room code.");
+        setLobbyBusy(false);
+        return;
+      }
+      const id = await findRoomIdByCode(code);
+      if (!id) {
+        setLobbyError("That code doesn't match a game.");
+        setLobbyBusy(false);
+        return;
+      }
+      const existing = await blobGet(id);
+      if (existing.seats.p2 && existing.seats.p2.present) {
+        setLobbyError("That room already has two players.");
+        setLobbyBusy(false);
+        return;
+      }
+      const updated = await joinRoomAndDeal(id, existing, myName.trim());
+      localStorage.setItem(SESSION_KEY, JSON.stringify({ roomId: id, seat: "p2", code }));
+      lastRevRef.current = updated.rev;
+      setRoomId(id);
+      setMySeat("p2");
+      setRoom(updated);
+      setScreen("room");
+    } catch (e) {
+      setLobbyError("Could not join that game. Check your connection and try again.");
+    }
+    setLobbyBusy(false);
+  };
+  const leaveRoom = () => {
+    localStorage.removeItem(SESSION_KEY);
+    setRoomId(null);
+    setMySeat(null);
+    setRoom(null);
+    setSel(null);
+    history.replaceState(null, "", location.pathname + location.search);
+    setScreen("home");
+  };
+
+  /* ---- committing a move: mutate a clone, score if won, write, then adopt locally ---- */
+  const commitMove = useCallback(
+    async (mutator) => {
+      if (!room || sending) return;
+      setSending(true);
+      const next = JSON.parse(JSON.stringify(room));
+      mutator(next.game);
+      applyScoreIfWinner(next);
+      next.rev += 1;
+      try {
+        await blobPut(roomId, next);
+        lastRevRef.current = next.rev;
+        setRoom(next);
+        setNetError("");
+      } catch (e) {
+        setNetError("That move didn't sync — check your connection and try again.");
+      }
+      setSending(false);
+    },
+    [room, roomId, sending]
+  );
+  const handlePlayAgain = async () => {
+    if (!room || sending) return;
+    setSending(true);
+    const next = JSON.parse(JSON.stringify(room));
+    const dealerIsP1 = next.board.games % 2 === 0;
+    const g = newGame(dealerIsP1);
+    g.names = next.game.names;
+    next.game = g;
+    next.rev += 1;
+    try {
+      await blobPut(roomId, next);
+      lastRevRef.current = next.rev;
+      setRoom(next);
+      setNetError("");
+    } catch (e) {
+      setNetError("Could not start a new game — try again.");
+    }
+    setSending(false);
+  };
+
+  const G = room && room.game;
+  const yourTurn = screen === "room" && G && !G.winner && G.turn === mySeat && !sending;
+  const oppSeat = mySeat ? otherOf(mySeat) : null;
+  const me = G && mySeat ? G.players[mySeat] : null;
+  const opp = G && oppSeat ? G.players[oppSeat] : null;
+  const oppName = G && oppSeat ? nm(G, oppSeat) : "Opponent";
+  const selCard = G && sel && yourTurn ? peekFrom(G, mySeat, sel) : null;
+
+  const clickSource = (src) => {
+    if (!yourTurn) return;
+    const c = peekFrom(G, mySeat, src);
+    if (!c) return;
+    setSel((s) => (s && s.type === src.type && s.index === src.index ? null : src));
+  };
+  const clickBuild = (i) => {
+    if (!yourTurn || !sel) return;
+    const c = peekFrom(G, mySeat, sel);
+    if (!canPlayTo(G, c, i)) return;
+    const src = sel;
+    commitMove((g) => doPlay(g, mySeat, src, i));
+    setSel(null);
+  };
+  const clickOwnDiscard = (i) => {
+    if (!yourTurn) return;
+    if (sel && sel.type === "hand") {
+      const idx = sel.index;
+      commitMove((g) => doDiscard(g, mySeat, idx, i));
+      setSel(null);
+      return;
+    }
+    clickSource({ type: "discard", index: i });
+  };
+  const passTurn = () => commitMove((g) => doPass(g, mySeat));
+
+  const inviteLink = room && room.code ? `${location.origin}${location.pathname}#room=${room.code}` : "";
+  const [copyMsg, setCopyMsg] = useState("");
+  const copyInvite = async () => {
+    try {
+      await navigator.clipboard.writeText(inviteLink);
+      setCopyMsg("Link copied.");
+    } catch (e) {
+      setCopyMsg("Copy failed — select and copy manually.");
+    }
+    setTimeout(() => setCopyMsg(""), 2500);
+  };
+
+  if (screen === "loading") {
+    return React.createElement("div", { style: S.root }, React.createElement("style", null, CSS), React.createElement("div", { style: S.loading }, "Loading…"));
+  }
+
+  if (screen === "home" || screen === "join") {
+    return React.createElement(
+      "div",
+      { style: S.root },
+      React.createElement("style", null, CSS),
+      React.createElement(
+        "div",
+        { style: S.lobbyWrap },
+        React.createElement("div", { style: S.eyebrow }, "Two decks · jokers wild · ace through king"),
+        React.createElement("h1", { style: S.title }, "Spite & Malice"),
+        React.createElement("div", { style: S.lobbySub }, "Play live with someone else, each on your own phone."),
+        React.createElement(
+          "div",
+          { style: S.lobbyCard },
+          React.createElement("label", { style: S.lobbyLabel }, "Your name (optional)"),
+          React.createElement("input", {
+            style: S.lobbyInput,
+            value: myName,
+            maxLength: 20,
+            placeholder: "e.g. Adam",
+            onChange: (e) => setMyName(e.target.value),
+          }),
+          screen === "home" &&
+            React.createElement(
+              "button",
+              { style: S.primaryBtn, disabled: lobbyBusy, onClick: handleCreate },
+              lobbyBusy ? "Creating…" : "Create a game"
+            ),
+          React.createElement("div", { style: S.orLine }, "— or —"),
+          React.createElement("label", { style: S.lobbyLabel }, "Room code"),
+          React.createElement("input", {
+            style: { ...S.lobbyInput, ...S.codeInput },
+            value: joinCode,
+            maxLength: 5,
+            placeholder: "ABCDE",
+            onChange: (e) => setJoinCode(e.target.value.toUpperCase()),
+          }),
+          React.createElement(
+            "button",
+            { style: S.ghostBtnBig, disabled: lobbyBusy, onClick: handleJoin },
+            lobbyBusy ? "Joining…" : "Join a game"
+          ),
+          lobbyError && React.createElement("div", { style: S.lobbyError }, lobbyError)
+        )
+      )
+    );
+  }
+
+  if (screen === "room" && room && room.phase === "waiting") {
+    return React.createElement(
+      "div",
+      { style: S.root },
+      React.createElement("style", null, CSS),
+      React.createElement(
+        "div",
+        { style: S.lobbyWrap },
+        React.createElement("div", { style: S.eyebrow }, "Waiting for your opponent"),
+        React.createElement("h1", { style: S.title }, "Spite & Malice"),
+        React.createElement(
+          "div",
+          { style: S.lobbyCard },
+          React.createElement("div", { style: S.roomCodeBig, className: "pulse" }, room.code),
+          React.createElement("div", { style: S.lobbySub }, "Share this code, or send the link below."),
+          React.createElement("button", { style: S.ghostBtnBig, onClick: copyInvite }, "Copy invite link"),
+          copyMsg && React.createElement("div", { style: S.codeMsg }, copyMsg),
+          React.createElement("div", { style: { ...S.lobbySub, wordBreak: "break-all", opacity: 0.55 } }, inviteLink),
+          React.createElement("button", { style: { ...S.ghostBtn, marginTop: 14 }, onClick: leaveRoom }, "Cancel")
+        )
+      )
+    );
+  }
+
+  if (!(screen === "room" && room && G)) {
+    return React.createElement("div", { style: S.root }, React.createElement("style", null, CSS), React.createElement("div", { style: S.loading }, "Loading…"));
+  }
+
+  const cs = census(G);
+
+  return React.createElement(
+    "div",
+    { style: S.root },
+    React.createElement("style", null, CSS),
+
+    React.createElement(
+      "header",
+      { style: S.head },
+      React.createElement(
+        "div",
+        null,
+        React.createElement("div", { style: S.eyebrow }, "Two decks · jokers wild · ace through king"),
+        React.createElement("h1", { style: S.title }, "Spite & Malice")
+      ),
+      React.createElement(
+        "div",
+        { style: S.headRight },
+        React.createElement(
+          "div",
+          { style: S.turnPill(yourTurn) },
+          G.winner
+            ? G.winner === "draw"
+              ? "Stalemate"
+              : G.winner === mySeat
+              ? "You win"
+              : `${oppName} wins`
+            : G.turn === mySeat
+            ? "Your turn"
+            : `Waiting on ${oppName}`
+        ),
+        G.winner
+          ? React.createElement("button", { style: S.ghostBtn, disabled: sending, onClick: handlePlayAgain }, "Play again")
+          : null,
+        React.createElement("button", { style: S.ghostBtn, onClick: leaveRoom }, "Leave")
+      )
+    ),
+
+    netError && React.createElement("div", { style: S.netError }, netError),
+
+    /* census */
+    React.createElement(
+      "div",
+      { style: S.census(cs.ok) },
+      React.createElement("span", { style: S.censusDot(cs.ok) }),
+      cs.ok
+        ? `${cs.total} cards accounted for · every rank ×2 · 4 jokers · room ${room.code}`
+        : `Deck error: ${cs.total} cards${cs.dupes.length ? " · " + cs.dupes.join(" ") : ""}`
+    ),
+
+    /* opponent */
+    React.createElement(
+      "section",
+      { style: S.zone },
+      React.createElement("div", { style: S.zoneLabel }, oppName),
+      React.createElement(
+        "div",
+        { style: S.row },
+        React.createElement(Stack, { label: "Stock", count: opp.stock.length, card: top(opp.stock), faceUp: true, big: true }),
+        React.createElement(
+          "div",
+          { style: S.discRow },
+          opp.discards.map((d, i) => React.createElement(DiscardFan, { key: i, pile: d, index: i }))
+        ),
+        React.createElement(
+          "div",
+          { style: S.handCount },
+          React.createElement("div", { style: S.miniBack }),
+          React.createElement("span", null, `${opp.hand.length} in hand`)
+        )
+      )
+    ),
+
+    /* center */
+    React.createElement(
+      "section",
+      { style: S.center },
+      React.createElement(
+        "div",
+        { style: S.centerSide },
+        React.createElement(Stack, { label: "Draw", count: G.draw.length, faceUp: false }),
+        React.createElement(Stack, { label: "Reshuffle", count: G.completed.length, faceUp: false, muted: true })
+      ),
+      React.createElement(
+        "div",
+        { style: S.buildRow },
+        G.build.map((pile, i) => {
+          const legal = !!selCard && canPlace(selCard, pile) && yourTurn;
+          return React.createElement(
+            "button",
+            { key: pile.id, onClick: () => clickBuild(i), style: S.buildSlot, className: legal ? "pulse" : "" },
+            React.createElement(CardFace, { card: top(pile.cards), standsFor: pileRank(pile) }),
+            React.createElement("div", { style: S.buildMeta }, `next ${RANK_LABEL[pileRank(pile)]}`)
+          );
+        }),
+        G.build.length < MAX_PILES &&
+          React.createElement(
+            "button",
+            {
+              onClick: () => clickBuild(-1),
+              style: S.buildSlot,
+              className: !!selCard && canStart(G, selCard) && yourTurn ? "pulse" : "",
+            },
+            React.createElement("div", { style: S.emptySlot }, "A"),
+            React.createElement("div", { style: S.buildMeta }, "new pile")
+          )
+      )
+    ),
+
+    /* you */
+    React.createElement(
+      "section",
+      { style: S.zone },
+      React.createElement("div", { style: S.zoneLabel }, "You"),
+      React.createElement(
+        "div",
+        { style: S.row },
+        React.createElement(
+          "button",
+          {
+            onClick: () => clickSource({ type: "stock" }),
+            style: S.plainBtn,
+            className: sel && sel.type === "stock" ? "sel" : "",
+          },
+          React.createElement(Stack, { label: "Your stock", count: me.stock.length, card: top(me.stock), faceUp: true, big: true })
+        ),
+        React.createElement(
+          "div",
+          { style: S.discRow },
+          me.discards.map((d, i) =>
+            React.createElement(
+              "button",
+              {
+                key: i,
+                onClick: () => clickOwnDiscard(i),
+                style: S.plainBtn,
+                className:
+                  (sel && sel.type === "discard" && sel.index === i ? "sel " : "") + (sel && sel.type === "hand" ? "target" : ""),
+              },
+              React.createElement(DiscardFan, { pile: d, index: i })
+            )
+          )
+        )
+      ),
+
+      React.createElement(
+        "div",
+        { style: S.hand },
+        me.hand.map((c, i) =>
+          React.createElement(
+            "button",
+            {
+              key: c.id,
+              onClick: () => clickSource({ type: "hand", index: i }),
+              style: S.plainBtn,
+              className: sel && sel.type === "hand" && sel.index === i ? "sel" : "",
+            },
+            React.createElement(CardFace, { card: c })
+          )
+        ),
+        !me.hand.length &&
+          React.createElement(
+            "div",
+            { style: S.emptyHand },
+            "Hand empty — no cards left to draw. ",
+            yourTurn && React.createElement("button", { style: S.ghostBtn, onClick: passTurn }, "Pass turn")
+          )
+      ),
+
+      React.createElement(
+        "div",
+        { style: S.hint },
+        G.winner
+          ? G.winner === "draw"
+            ? "Nobody can move and there are no cards left to turn over. Deal again."
+            : G.winner === mySeat
+            ? "Stock cleared. Game to you."
+            : `${oppName} cleared their stock.`
+          : !yourTurn
+          ? `Waiting on ${oppName}.`
+          : sel
+          ? sel.type === "hand"
+            ? "Tap a center pile to play it, or one of your discard piles to end the turn."
+            : "Tap a center pile to play it."
+          : "Tap your stock, a discard pile, or a hand card to pick it up."
+      )
+    ),
+
+    /* panel */
+    React.createElement(
+      "section",
+      { style: S.panel },
+      React.createElement(
+        "div",
+        { style: S.tabs },
+        React.createElement("button", { style: S.tab(tab === "log"), onClick: () => setTab("log") }, "Play log"),
+        React.createElement("button", { style: S.tab(tab === "score"), onClick: () => setTab("score") }, "Scoreboard"),
+        React.createElement("button", { style: S.tab(tab === "room"), onClick: () => setTab("room") }, "Room")
+      ),
+      tab === "room"
+        ? React.createElement(
+            "div",
+            { style: S.codePanel },
+            React.createElement("div", { style: S.scoreNote }, "Share this code or link to bring someone else into this game."),
+            React.createElement("div", { style: S.roomCodeBig }, room.code),
+            React.createElement("button", { style: S.ghostBtn, onClick: copyInvite }, "Copy invite link"),
+            copyMsg && React.createElement("div", { style: S.codeMsg }, copyMsg),
+            React.createElement(
+              "div",
+              { style: S.scoreNote },
+              `${nm(G, "p1")} — seat 1${mySeat === "p1" ? " (you)" : ""}. ${nm(G, "p2")} — seat 2${mySeat === "p2" ? " (you)" : ""}.`
+            )
+          )
+        : tab === "log"
+        ? React.createElement(
+            "div",
+            { style: S.log, ref: logRef },
+            G.log.slice(-60).map((l, i) => React.createElement("div", { key: i, style: S.logLine(l) }, renderLog(l, mySeat, G)))
+          )
+        : React.createElement(
+            "div",
+            { style: S.score },
+            React.createElement(
+              "div",
+              { style: S.scoreGrid },
+              React.createElement(ScoreCell, {
+                name: "You",
+                wins: mySeat === "p1" ? room.board.p1Wins : room.board.p2Wins,
+                pts: mySeat === "p1" ? room.board.p1Pts : room.board.p2Pts,
+                lead:
+                  (mySeat === "p1" ? room.board.p1Pts : room.board.p2Pts) >=
+                  (mySeat === "p1" ? room.board.p2Pts : room.board.p1Pts),
+              }),
+              React.createElement(ScoreCell, {
+                name: oppName,
+                wins: mySeat === "p1" ? room.board.p2Wins : room.board.p1Wins,
+                pts: mySeat === "p1" ? room.board.p2Pts : room.board.p1Pts,
+                lead:
+                  (mySeat === "p1" ? room.board.p2Pts : room.board.p1Pts) >
+                  (mySeat === "p1" ? room.board.p1Pts : room.board.p2Pts),
+              })
+            ),
+            React.createElement(
+              "div",
+              { style: S.scoreNote },
+              `${room.board.games} game${room.board.games === 1 ? "" : "s"} played. The winner scores what is left in the other stock: wilds 20, face cards 10, aces 1, everything else at its number.`
+            ),
+            React.createElement(
+              "div",
+              { style: S.history },
+              (room.board.history || []).slice(0, 10).map((h, i) =>
+                React.createElement(
+                  "div",
+                  { key: i, style: S.histLine },
+                  React.createElement("span", { style: { color: h.w === mySeat ? "#D8B45A" : "#7FA8A0" } }, h.w === mySeat ? "You" : oppName),
+                  React.createElement("span", null, `+${h.pts}`),
+                  h.left != null && React.createElement("span", { style: { opacity: 0.5 } }, `${h.left} left`)
+                )
+              ),
+              !room.board.games && React.createElement("div", { style: { opacity: 0.5 } }, "No games recorded yet.")
+            )
+          )
+    )
+  );
+}
+
+/* ---------- pieces (unchanged from the original) ---------- */
+function CardFace({ card, standsFor, small }) {
+  if (!card) return null;
+  const wild = card.rank === 0;
+  const red = isRed(card);
+  return React.createElement(
+    "div",
+    { style: { ...S.card(small), ...(wild ? S.wildCard : null) } },
+    React.createElement(
+      "div",
+      { style: { ...S.cardRank(small), color: wild ? "#8A6A18" : red ? "#B33A34" : "#1A1D24" } },
+      wild && standsFor ? RANK_LABEL[standsFor - 1] : label(card)
+    ),
+    React.createElement(
+      "div",
+      { style: { ...S.cardSuit(small), color: wild ? "#8A6A18" : red ? "#B33A34" : "#1A1D24" } },
+      wild ? "wild" : SUITS.find((s) => s.k === card.suit).g
+    )
+  );
+}
+function Stack({ label: lb, count, card, faceUp, big, small, muted }) {
+  return React.createElement(
+    "div",
+    { style: S.stackWrap },
+    React.createElement("div", { style: S.stackLabel }, lb),
+    React.createElement(
+      "div",
+      { style: S.stackBody },
+      count === 0
+        ? React.createElement("div", { style: S.emptyStack })
+        : faceUp && card
+        ? React.createElement(CardFace, { card, small })
+        : React.createElement("div", { style: { ...S.back(small), opacity: muted ? 0.45 : 1 } }),
+      React.createElement("div", { style: S.count(big) }, count)
+    )
+  );
+}
+function DiscardFan({ pile, index }) {
+  const n = pile.length;
+  const step = n > 1 ? Math.max(8, Math.min(18, 112 / (n - 1))) : 0;
+  const h = n ? 60 + step * (n - 1) : 60;
+  return React.createElement(
+    "div",
+    { style: S.fanWrap },
+    React.createElement("div", { style: S.stackLabel }, `D${index + 1}`, n > 0 && React.createElement("span", { style: S.fanCount }, n)),
+    React.createElement(
+      "div",
+      { style: { ...S.fanBody, height: h } },
+      n === 0 && React.createElement("div", { style: S.fanEmpty }),
+      pile.map((c, i) => {
+        const isTop = i === n - 1;
+        const wild = c.rank === 0;
+        const red = isRed(c);
+        return React.createElement(
+          "div",
+          { key: c.id, style: { ...S.fanCard(isTop, wild), top: i * step, zIndex: i + 1 } },
+          React.createElement(
+            "span",
+            { style: { ...S.fanCorner, color: wild ? "#8A6A18" : red ? "#B33A34" : "#1A1D24" } },
+            label(c),
+            c.suit ? SUITS.find((s) => s.k === c.suit).g : ""
+          )
+        );
+      })
+    )
+  );
+}
+function ScoreCell({ name, wins, pts, lead }) {
+  return React.createElement(
+    "div",
+    { style: S.scoreCell(lead) },
+    React.createElement("div", { style: S.scoreName }, name),
+    React.createElement("div", { style: S.scorePts }, pts),
+    React.createElement("div", { style: S.scoreWins }, `${wins} win${wins === 1 ? "" : "s"}`)
+  );
+}
+
+/* ---------- style (unchanged palette: felt green + brass + bone) ---------- */
+const INK = "#101620";
+const FELT = "#16303A";
+const BONE = "#F2ECDD";
+const BRASS = "#C9A227";
+const JADE = "#4E9B8A";
+
+const CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Bodoni+Moda:wght@600;800&family=Oswald:wght@400;600&family=Inter:wght@400;500;600&display=swap');
+* { box-sizing: border-box; }
+button { font: inherit; cursor: pointer; }
+.sel > div { outline: 2px solid ${BRASS}; outline-offset: 3px; border-radius: 9px; }
+.target > div { outline: 1px dashed rgba(201,162,39,.55); outline-offset: 3px; border-radius: 9px; }
+.pulse { animation: pl 1.6s ease-in-out infinite; }
+@keyframes pl { 0%,100% { box-shadow: 0 0 0 0 rgba(201,162,39,.55); } 50% { box-shadow: 0 0 0 7px rgba(201,162,39,0); } }
+@media (prefers-reduced-motion: reduce) { .pulse { animation: none; } }
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-thumb { background: rgba(242,236,221,.18); border-radius: 3px; }
+`;
+
+const S = {
+  root: {
+    minHeight: "100vh",
+    background: `radial-gradient(120% 90% at 50% 0%, ${FELT} 0%, ${INK} 65%)`,
+    color: BONE,
+    fontFamily: "Inter, system-ui, sans-serif",
+    padding: "14px 12px 28px",
+    display: "flex",
+    flexDirection: "column",
+    gap: 12,
+  },
+  loading: { padding: 40, textAlign: "center", opacity: 0.6, fontFamily: "Oswald, sans-serif", letterSpacing: ".1em", textTransform: "uppercase" },
+  lobbyWrap: { maxWidth: 420, margin: "8vh auto 0", display: "flex", flexDirection: "column", gap: 14, alignItems: "center", textAlign: "center", padding: "0 6px" },
+  lobbySub: { fontSize: 13, color: "rgba(242,236,221,.65)", lineHeight: 1.5 },
+  lobbyCard: { width: "100%", background: "rgba(0,0,0,.25)", border: "1px solid rgba(242,236,221,.1)", borderRadius: 14, padding: 20, display: "flex", flexDirection: "column", gap: 10 },
+  lobbyLabel: { fontFamily: "Oswald, sans-serif", fontSize: 10, letterSpacing: ".14em", textTransform: "uppercase", color: "rgba(242,236,221,.5)", textAlign: "left" },
+  lobbyInput: {
+    width: "100%",
+    background: "rgba(0,0,0,.35)",
+    color: BONE,
+    border: "1px solid rgba(242,236,221,.22)",
+    borderRadius: 8,
+    padding: "10px 12px",
+    fontSize: 15,
+  },
+  codeInput: { textTransform: "uppercase", letterSpacing: ".3em", textAlign: "center", fontFamily: "'Bodoni Moda', Georgia, serif", fontSize: 20 },
+  orLine: { fontSize: 11, opacity: 0.4, margin: "4px 0" },
+  primaryBtn: {
+    background: BRASS,
+    color: INK,
+    border: "none",
+    borderRadius: 999,
+    padding: "12px 16px",
+    fontFamily: "Oswald, sans-serif",
+    fontSize: 13,
+    letterSpacing: ".08em",
+    textTransform: "uppercase",
+    fontWeight: 600,
+  },
+  ghostBtnBig: {
+    background: "transparent",
+    border: "1px solid rgba(242,236,221,.3)",
+    color: BONE,
+    borderRadius: 999,
+    padding: "12px 16px",
+    fontSize: 13,
+    fontFamily: "Oswald, sans-serif",
+    letterSpacing: ".08em",
+    textTransform: "uppercase",
+  },
+  lobbyError: { color: "#F0B0A8", fontSize: 12.5, marginTop: 4 },
+  roomCodeBig: {
+    fontFamily: "'Bodoni Moda', Georgia, serif",
+    fontWeight: 800,
+    fontSize: 36,
+    letterSpacing: ".14em",
+    color: BRASS,
+    padding: "10px 0",
+  },
+  netError: {
+    fontSize: 12,
+    color: "#F0B0A8",
+    background: "rgba(200,84,74,.12)",
+    border: "1px solid rgba(200,84,74,.35)",
+    borderRadius: 8,
+    padding: "6px 10px",
+  },
+  head: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, flexWrap: "wrap" },
+  eyebrow: {
+    fontFamily: "Oswald, sans-serif",
+    fontSize: 10,
+    letterSpacing: ".18em",
+    textTransform: "uppercase",
+    color: "rgba(242,236,221,.55)",
+  },
+  title: { fontFamily: "'Bodoni Moda', Georgia, serif", fontSize: "clamp(26px,7vw,40px)", fontWeight: 800, margin: "2px 0 0", letterSpacing: "-.01em" },
+  headRight: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" },
+  turnPill: (mine) => ({
+    fontFamily: "Oswald, sans-serif",
+    fontSize: 11,
+    letterSpacing: ".12em",
+    textTransform: "uppercase",
+    padding: "6px 11px",
+    borderRadius: 999,
+    background: mine ? BRASS : "rgba(242,236,221,.09)",
+    color: mine ? INK : "rgba(242,236,221,.75)",
+    whiteSpace: "nowrap",
+  }),
+  ghostBtn: {
+    background: "transparent",
+    border: "1px solid rgba(242,236,221,.28)",
+    color: BONE,
+    borderRadius: 999,
+    padding: "6px 12px",
+    fontSize: 12,
+  },
+  census: (ok) => ({
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    fontFamily: "Oswald, sans-serif",
+    fontSize: 10.5,
+    letterSpacing: ".1em",
+    textTransform: "uppercase",
+    color: ok ? "rgba(242,236,221,.6)" : "#F0B0A8",
+    borderTop: "1px solid rgba(242,236,221,.1)",
+    borderBottom: "1px solid rgba(242,236,221,.1)",
+    padding: "7px 2px",
+    flexWrap: "wrap",
+  }),
+  censusDot: (ok) => ({ width: 7, height: 7, borderRadius: 999, background: ok ? JADE : "#C8544A", flexShrink: 0 }),
+  zone: { display: "flex", flexDirection: "column", gap: 8 },
+  zoneLabel: {
+    fontFamily: "Oswald, sans-serif",
+    fontSize: 10,
+    letterSpacing: ".2em",
+    textTransform: "uppercase",
+    color: "rgba(242,236,221,.45)",
+  },
+  row: { display: "flex", alignItems: "flex-start", gap: 10, flexWrap: "wrap" },
+  discRow: { display: "flex", gap: 5 },
+  fanWrap: { display: "flex", flexDirection: "column", gap: 4, alignItems: "center" },
+  fanCount: {
+    marginLeft: 4,
+    padding: "0 4px",
+    borderRadius: 999,
+    background: "rgba(242,236,221,.14)",
+    color: "rgba(242,236,221,.8)",
+  },
+  fanBody: { position: "relative", width: 44 },
+  fanEmpty: {
+    width: 44,
+    height: 60,
+    borderRadius: 7,
+    border: "1px dashed rgba(242,236,221,.22)",
+  },
+  fanCard: (isTop, wild) => ({
+    position: "absolute",
+    left: 0,
+    width: 44,
+    height: 60,
+    borderRadius: 7,
+    background: wild
+      ? "linear-gradient(160deg,#F6E9BE 0%,#EBD9A2 100%)"
+      : "linear-gradient(160deg,#FBF7EC 0%,#F2ECDD 70%,#E4DCC7 100%)",
+    border: isTop ? `1.5px solid ${BRASS}` : "1px solid rgba(16,22,32,.4)",
+    boxShadow: isTop ? "0 3px 8px rgba(0,0,0,.5)" : "0 1px 3px rgba(0,0,0,.45)",
+    padding: "3px 0 0 4px",
+  }),
+  fanCorner: {
+    fontFamily: "'Bodoni Moda', Georgia, serif",
+    fontWeight: 800,
+    fontSize: 14,
+    lineHeight: 1,
+    letterSpacing: "-.02em",
+  },
+  handCount: { display: "flex", alignItems: "center", gap: 6, fontSize: 11, opacity: 0.6, marginLeft: "auto" },
+  miniBack: {
+    width: 16,
+    height: 22,
+    borderRadius: 3,
+    background: `repeating-linear-gradient(45deg, #24435080, #24435080 2px, #16303a80 2px, #16303a80 4px)`,
+    border: "1px solid rgba(242,236,221,.25)",
+  },
+  center: {
+    display: "flex",
+    gap: 10,
+    alignItems: "center",
+    padding: "12px 8px",
+    borderRadius: 12,
+    background: "rgba(0,0,0,.22)",
+    border: "1px solid rgba(242,236,221,.08)",
+    flexWrap: "wrap",
+  },
+  centerSide: { display: "flex", gap: 8 },
+  buildRow: { display: "flex", gap: 6, flexWrap: "wrap", flex: 1, justifyContent: "center" },
+  buildSlot: {
+    background: "transparent",
+    border: "none",
+    padding: 0,
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    gap: 4,
+    borderRadius: 9,
+  },
+  buildMeta: {
+    fontFamily: "Oswald, sans-serif",
+    fontSize: 9,
+    letterSpacing: ".08em",
+    textTransform: "uppercase",
+    color: "rgba(242,236,221,.5)",
+  },
+  emptySlot: {
+    width: "clamp(42px,11vw,60px)",
+    height: "clamp(60px,15.4vw,84px)",
+    borderRadius: 8,
+    border: "1px dashed rgba(242,236,221,.3)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontFamily: "'Bodoni Moda', Georgia, serif",
+    fontSize: 20,
+    color: "rgba(242,236,221,.28)",
+  },
+  card: (small) => ({
+    width: small ? "clamp(34px,9vw,48px)" : "clamp(42px,11vw,60px)",
+    height: small ? "clamp(48px,12.6vw,67px)" : "clamp(60px,15.4vw,84px)",
+    borderRadius: 8,
+    background: `linear-gradient(160deg, #FBF7EC 0%, ${BONE} 60%, #E4DCC7 100%)`,
+    border: "1px solid rgba(16,22,32,.35)",
+    boxShadow: "0 2px 5px rgba(0,0,0,.4)",
+    display: "flex",
+    flexDirection: "column",
+    justifyContent: "center",
+    alignItems: "center",
+    gap: 1,
+  }),
+  wildCard: { background: `linear-gradient(160deg, #F6E9BE 0%, #EBD9A2 100%)`, border: `1px solid ${BRASS}` },
+  cardRank: (small) => ({
+    fontFamily: "'Bodoni Moda', Georgia, serif",
+    fontWeight: 800,
+    fontSize: small ? "clamp(14px,3.6vw,19px)" : "clamp(17px,4.6vw,24px)",
+    lineHeight: 1,
+  }),
+  cardSuit: (small) => ({ fontSize: small ? 11 : 14, lineHeight: 1, opacity: 0.9 }),
+  back: (small) => ({
+    width: small ? "clamp(34px,9vw,48px)" : "clamp(42px,11vw,60px)",
+    height: small ? "clamp(48px,12.6vw,67px)" : "clamp(60px,15.4vw,84px)",
+    borderRadius: 8,
+    background: `repeating-linear-gradient(45deg, #274b58, #274b58 3px, #1b3945 3px, #1b3945 6px)`,
+    border: `1px solid ${BRASS}55`,
+    boxShadow: "inset 0 0 0 3px rgba(201,162,39,.18), 0 2px 5px rgba(0,0,0,.4)",
+  }),
+  emptyStack: {
+    width: "clamp(34px,9vw,48px)",
+    height: "clamp(48px,12.6vw,67px)",
+    borderRadius: 8,
+    border: "1px dashed rgba(242,236,221,.22)",
+  },
+  stackWrap: { display: "flex", flexDirection: "column", gap: 4, alignItems: "center" },
+  stackLabel: {
+    fontFamily: "Oswald, sans-serif",
+    fontSize: 9,
+    letterSpacing: ".12em",
+    textTransform: "uppercase",
+    color: "rgba(242,236,221,.45)",
+  },
+  stackBody: { position: "relative" },
+  count: (big) => ({
+    position: "absolute",
+    right: -5,
+    bottom: -5,
+    minWidth: big ? 22 : 17,
+    height: big ? 22 : 17,
+    padding: "0 4px",
+    borderRadius: 999,
+    background: big ? BRASS : "rgba(16,22,32,.92)",
+    color: big ? INK : BONE,
+    border: "1px solid rgba(242,236,221,.3)",
+    fontSize: big ? 12 : 10,
+    fontWeight: 600,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+  }),
+  plainBtn: { background: "transparent", border: "none", padding: 0 },
+  hand: {
+    display: "flex",
+    gap: 6,
+    flexWrap: "wrap",
+    padding: "10px 8px",
+    borderRadius: 12,
+    background: "rgba(0,0,0,.25)",
+    border: "1px solid rgba(242,236,221,.08)",
+    minHeight: 70,
+    alignItems: "center",
+  },
+  emptyHand: { fontSize: 12, opacity: 0.45 },
+  hint: { fontSize: 12, color: "rgba(242,236,221,.6)", minHeight: 18 },
+  panel: { borderRadius: 12, background: "rgba(0,0,0,.25)", border: "1px solid rgba(242,236,221,.08)", overflow: "hidden" },
+  tabs: { display: "flex", borderBottom: "1px solid rgba(242,236,221,.1)" },
+  tab: (on) => ({
+    flex: 1,
+    background: on ? "rgba(242,236,221,.07)" : "transparent",
+    border: "none",
+    color: on ? BONE : "rgba(242,236,221,.5)",
+    padding: "9px 8px",
+    fontFamily: "Oswald, sans-serif",
+    fontSize: 11,
+    letterSpacing: ".12em",
+    textTransform: "uppercase",
+  }),
+  log: { maxHeight: 150, overflowY: "auto", padding: "8px 12px", display: "flex", flexDirection: "column", gap: 3 },
+  logLine: (l) => ({
+    fontSize: 12,
+    color: l.stock ? BRASS : l.end ? "rgba(242,236,221,.45)" : "rgba(242,236,221,.8)",
+  }),
+  score: { padding: 12, display: "flex", flexDirection: "column", gap: 10 },
+  scoreGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 },
+  scoreCell: (lead) => ({
+    padding: "10px 12px",
+    borderRadius: 10,
+    background: lead ? "rgba(201,162,39,.12)" : "rgba(242,236,221,.05)",
+    border: `1px solid ${lead ? "rgba(201,162,39,.4)" : "rgba(242,236,221,.1)"}`,
+  }),
+  scoreName: {
+    fontFamily: "Oswald, sans-serif",
+    fontSize: 10,
+    letterSpacing: ".16em",
+    textTransform: "uppercase",
+    color: "rgba(242,236,221,.6)",
+  },
+  scorePts: { fontFamily: "'Bodoni Moda', Georgia, serif", fontSize: 30, fontWeight: 800, lineHeight: 1.1 },
+  scoreWins: { fontSize: 11, opacity: 0.6 },
+  scoreNote: { fontSize: 11.5, color: "rgba(242,236,221,.55)", lineHeight: 1.5 },
+  codePanel: { padding: 12, display: "flex", flexDirection: "column", gap: 8, alignItems: "flex-start" },
+  codeMsg: { fontSize: 12, color: BRASS },
+  history: { display: "flex", flexDirection: "column", gap: 3, fontSize: 12 },
+  histLine: { display: "flex", gap: 10 },
+};
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(React.createElement(App));
+</script>
+</body>
+</html>
