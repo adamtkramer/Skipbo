@@ -524,16 +524,19 @@ function App() {
   }, []);
 
   /* ---- poll the room while one is open ----
-     Polls on an interval, but also fires immediately on mount and whenever
-     the tab regains focus/visibility — this is what makes the "waiting for
-     opponent" screen flip over to the live game the instant they join,
-     with no manual refresh needed. Skips ticks while the tab is hidden to
-     cut needless load on the shared backend. */
+     Polls on an interval regardless of tab visibility — this is what makes
+     the "waiting for opponent" screen flip over to the live game once the
+     other player joins, with no manual refresh needed, even if the tab was
+     backgrounded (browsers throttle background timers but do not stop
+     them outright, so this still catches up; the wake listener below makes
+     it near-instant the moment focus returns). Deliberately does NOT skip
+     ticks while hidden: an earlier version did, and that meant a
+     backgrounded "waiting" tab could sit stale until manually refreshed —
+     exactly the bug this is fixing. */
   useEffect(() => {
     if (!roomId) return;
     let stopped = false;
     const tick = async () => {
-      if (document.hidden) return;
       try {
         const data = await blobGet(roomId);
         if (!stopped && data.rev > lastRevRef.current) {
@@ -547,9 +550,7 @@ function App() {
     };
     tick();
     const id = setInterval(tick, 2200 + Math.floor(Math.random() * 600));
-    const onWake = () => {
-      if (!document.hidden) tick();
-    };
+    const onWake = () => tick();
     document.addEventListener("visibilitychange", onWake);
     window.addEventListener("focus", onWake);
     return () => {
