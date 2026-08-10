@@ -275,7 +275,7 @@ function renderLog(entry, mySeat, G) {
     case "reshuffle":
       return `Draw pile ran out — finished piles reshuffled underneath (${entry.n}).`;
     case "strip":
-      return `Nothing left to draw and no finished piles — ${entry.n} cards taken from under the centre piles and shuffled. Every pile keeps its top card and its rank.`;
+      return `Nothing left to draw and no finished piles — ${entry.n} cards taken from under the centre piles and shuffled. Every pile keeps its top card and its rank.";
     case "stalemate":
       return "No cards left in play. The hand is a stalemate.";
     case "system":
@@ -336,21 +336,50 @@ function applyScoreIfWinner(room) {
 
 /* ============================================================
    SHARED-STATE BACKEND — a JSON blob per room (jsonblob.com),
-   polled every ~1.5s. One directory blob maps short room codes
-   to the per-room blob id.
+   polled every ~2.5s. One directory blob maps short room codes
+   to the per-room blob id. Reads/writes retry with backoff on
+   429s from jsonblob's free-tier rate limit (60 req/60s).
    ============================================================ */
 const JB = "https://jsonblob.com/api/jsonBlob";
 const DIRECTORY_ID = "019fe884-9a36-711f-90c6-1bbbf331f2a4";
 const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"; // no 0/O/1/I/L
 const SESSION_KEY = "spite-malice:session";
 
+/* jsonblob's free anonymous tier allows 60 requests/60s. A couple of active
+   players polling plus room-creation/join traffic can brush against that, so
+   every call here rides out a transient 429 with a few backed-off retries
+   before it ever surfaces as a user-facing error. */
+function sleep(ms) {
+  return new Promise((res) => setTimeout(res, ms));
+}
+async function fetchWithRetry(url, opts, tries) {
+  tries = tries || 4;
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    let r;
+    try {
+      r = await fetch(url, opts);
+    } catch (e) {
+      lastErr = e;
+      if (i < tries - 1) await sleep(500 * Math.pow(2, i) + Math.random() * 250);
+      continue;
+    }
+    if (r.status === 429) {
+      lastErr = new Error("rate-limited");
+      if (i < tries - 1) await sleep(700 * Math.pow(2, i) + Math.random() * 300);
+      continue;
+    }
+    return r;
+  }
+  throw lastErr || new Error("request-failed");
+}
 async function blobGet(id) {
-  const r = await fetch(`${JB}/${id}`, { cache: "no-store" });
+  const r = await fetchWithRetry(`${JB}/${id}`, { cache: "no-store" });
   if (!r.ok) throw new Error("get-failed");
   return r.json();
 }
 async function blobPut(id, obj) {
-  const r = await fetch(`${JB}/${id}`, {
+  const r = await fetchWithRetry(`${JB}/${id}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(obj),
@@ -358,7 +387,7 @@ async function blobPut(id, obj) {
   if (!r.ok) throw new Error("put-failed");
 }
 async function blobCreate(obj) {
-  const r = await fetch(JB, {
+  const r = await fetchWithRetry(JB, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(obj),
@@ -393,10 +422,12 @@ async function createRoom(name) {
     try {
       dir = await blobGet(DIRECTORY_ID);
     } catch (e) {
-      dir = { codes: {} };
+      // Directory unreachable even after retries — don't risk clobbering
+      // everyone else's room codes with an empty directory. Try again.
+      continue;
     }
-    if (dir.codes && dir.codes[candidate]) continue;
     dir.codes = dir.codes || {};
+    if (dir.codes[candidate]) continue;
     dir.codes[candidate] = roomId;
     await blobPut(DIRECTORY_ID, dir);
     code = candidate;
@@ -493,7 +524,7 @@ function App() {
         /* transient — retry on the next tick */
       }
     };
-    const id = setInterval(tick, 1500);
+    const id = setInterval(tick, 2500);
     return () => {
       stopped = true;
       clearInterval(id);
