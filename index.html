@@ -1,5 +1,4 @@
 <!DOCTYPE html>
-<!-- redeploy trigger -->
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
@@ -337,9 +336,11 @@ function applyScoreIfWinner(room) {
 
 /* ============================================================
    SHARED-STATE BACKEND — a JSON blob per room (jsonblob.com),
-   polled every ~2.5s. One directory blob maps short room codes
-   to the per-room blob id. Reads/writes retry with backoff on
-   429s from jsonblob's free-tier rate limit (60 req/60s).
+   polled every ~2.2-2.8s (jittered), paused while the tab is
+   hidden, and re-checked immediately on focus. One directory
+   blob maps short room codes to the per-room blob id. Reads/
+   writes retry with backoff on 429s from jsonblob's free-tier
+   rate limit (60 req/60s).
    ============================================================ */
 const JB = "https://jsonblob.com/api/jsonBlob";
 const DIRECTORY_ID = "019fe884-9a36-711f-90c6-1bbbf331f2a4";
@@ -354,7 +355,7 @@ function sleep(ms) {
   return new Promise((res) => setTimeout(res, ms));
 }
 async function fetchWithRetry(url, opts, tries) {
-  tries = tries || 4;
+  tries = tries || 5;
   let lastErr;
   for (let i = 0; i < tries; i++) {
     let r;
@@ -367,7 +368,20 @@ async function fetchWithRetry(url, opts, tries) {
     }
     if (r.status === 429) {
       lastErr = new Error("rate-limited");
-      if (i < tries - 1) await sleep(700 * Math.pow(2, i) + Math.random() * 300);
+      if (i < tries - 1) {
+        // jsonblob tells us how long the window has left — honor it
+        // (capped) instead of guessing, so we don't hammer it again
+        // while it's still cooling down.
+        let waitSec = 0;
+        try {
+          const body = await r.clone().json();
+          if (body && typeof body.retryAfterSeconds === "number") waitSec = body.retryAfterSeconds;
+        } catch (e2) {
+          /* body wasn't JSON — fall back to the default backoff below */
+        }
+        const backoff = 700 * Math.pow(2, i) + Math.random() * 300;
+        await sleep(Math.min(Math.max(waitSec * 1000, backoff), 8000));
+      }
       continue;
     }
     return r;
@@ -509,11 +523,17 @@ function App() {
     })();
   }, []);
 
-  /* ---- poll the room while one is open ---- */
+  /* ---- poll the room while one is open ----
+     Polls on an interval, but also fires immediately on mount and whenever
+     the tab regains focus/visibility — this is what makes the "waiting for
+     opponent" screen flip over to the live game the instant they join,
+     with no manual refresh needed. Skips ticks while the tab is hidden to
+     cut needless load on the shared backend. */
   useEffect(() => {
     if (!roomId) return;
     let stopped = false;
     const tick = async () => {
+      if (document.hidden) return;
       try {
         const data = await blobGet(roomId);
         if (!stopped && data.rev > lastRevRef.current) {
@@ -525,10 +545,18 @@ function App() {
         /* transient — retry on the next tick */
       }
     };
-    const id = setInterval(tick, 2500);
+    tick();
+    const id = setInterval(tick, 2200 + Math.floor(Math.random() * 600));
+    const onWake = () => {
+      if (!document.hidden) tick();
+    };
+    document.addEventListener("visibilitychange", onWake);
+    window.addEventListener("focus", onWake);
     return () => {
       stopped = true;
       clearInterval(id);
+      document.removeEventListener("visibilitychange", onWake);
+      window.removeEventListener("focus", onWake);
     };
   }, [roomId]);
 
